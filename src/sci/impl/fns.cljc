@@ -20,6 +20,94 @@
           ^clojure.lang.ISeq (.next)
           (.first)))
 
+(deftype cowmap [^java.util.HashMap entries _meta]
+  java.util.Map
+  (get [this k] (.get entries k))
+  ;;We allow mutable updates through this path...shh
+  (put [this k v] (.put entries k v))
+  (containsKey [this k] (.containsKey entries k))
+  clojure.lang.IPersistentMap
+  (valAt [this k]           (.get entries k))
+  (valAt [this k not-found] (.getOrDefault entries k not-found))
+  (entryAt [this k]
+    (let [v (.valAt this k ::not-found)]
+      (when-not (identical? v ::not-found)
+        (clojure.lang.MapEntry. k v))))
+  (assoc [this k v]
+    (with-meta (.assoc ^clojure.lang.Associative  (into {} entries) k v) _meta))
+  (without [this k]
+    (if (.containsKey this k)
+      (with-meta (.without ^clojure.lang.IPersistentMap (into {} entries) k) _meta)
+      this))
+  (cons [this kv]
+    (.assoc this (first kv) (second kv)))
+  (empty [this] (cowmap. (java.util.HashMap.) {}))
+  (seq [this] (for [[k v] (seq entries)]
+                (clojure.lang.MapEntry. k v)))
+  clojure.lang.IObj
+  (meta [this] _meta)
+  (withMeta [this m] (cowmap. entries m))
+  (count [this] (.size entries))
+  )
+
+;;probably bad for multithreaded, but should be good for single?
+(defn bindings-ctx [ctx fn-name params macro?]
+  (let [n (count params)
+        outer-binds (.get ^java.util.Map ctx :bindings)
+        binds       (cowmap. (java.util.HashMap. n) {})
+        outer (assoc ctx :bindings binds)
+        init-params (seq params)] ;;naive, need to destructure
+    (fn [args]
+      (loop [^clojure.lang.ISeq args* (seq args) ;;seems avoidable...
+             ^clojure.lang.ISeq params init-params
+             ^java.util.Map     ret binds]
+        (if params
+          (let [fp (.first params)]
+            (if (identical? '& fp) ;;should be faster
+              (doto  ret (.put (fast-second params) args*))
+              (do (when-not args*
+                    (throw-arity fn-name macro? args))
+                  (recur (.next args*) (.next params)
+                         (doto ret (.put fp (.first args*)))))))
+          (do
+            (when args*
+              (throw-arity fn-name macro? args))
+            ret)))
+      outer)))
+
+(defn parse-fn-args+body
+  [^clojure.lang.Associative ctx interpret eval-do*
+   {:sci.impl/keys [fixed-arity var-arg-name params body] :as _m}
+   fn-name macro? with-meta?]
+  (let [min-var-args-arity (when var-arg-name fixed-arity)
+        load-binds! (bindings-ctx ctx fn-name params macro?)
+        ;;lifted out, probably minor, but on repeat invocations it'll
+        ;;add up...
+        return (if (= 1 (count body))
+                 (let [x (first body)]
+                   #(interpret % x)
+                   #(eval-do* % body)))
+        f (fn run-fn [& args]
+            (let [ret (-> args load-binds! return)
+                  recur? (instance? Recur ret)]
+              (if recur?
+                (let [recur-val (t/getVal ret)]
+                  (if min-var-args-arity
+                    (let [[fixed-args [rest-args]]
+                          [(subvec recur-val 0 min-var-args-arity)
+                           (subvec recur-val min-var-args-arity)]]
+                      (recur (into fixed-args rest-args)))
+                    (recur recur-val)))
+                ret)))]
+    (if with-meta?
+      (with-meta
+        f
+        (if min-var-args-arity
+          {:sci.impl/min-var-args-arity min-var-args-arity}
+          {:sci.impl/fixed-arity fixed-arity}))
+      f)))
+
+#_
 (defn parse-fn-args+body
   [^clojure.lang.Associative ctx interpret eval-do*
    {:sci.impl/keys [fixed-arity var-arg-name params body] :as _m}
